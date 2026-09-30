@@ -86,21 +86,6 @@ macro_rules! quoted_string {
     };
 }
 
-macro_rules! unquoted_string {
-    ($attrs:expr, $attr:expr) => {
-        match $attrs.remove($attr) {
-            Some(QuotedOrUnquoted::Unquoted(s)) => Some(s),
-            Some(QuotedOrUnquoted::Quoted(_)) => {
-                return Err(format!(
-                    "Can't create {} attribute from quoted string",
-                    $attr
-                ))
-            }
-            None => None,
-        }
-    };
-}
-
 macro_rules! unquoted_string_parse {
     ($attrs:expr, $attr:expr, $parse:expr) => {
         match $attrs.remove($attr) {
@@ -968,19 +953,35 @@ pub struct Key {
 }
 
 impl Key {
+    /// Accepts both quoted and unquoted attribute values.
+    ///
+    /// Kept deliberately lenient so that an attribute-level quirk can never
+    /// escalate into dropping the whole `EXT-X-KEY` tag: that would make
+    /// `MediaSegment::key` become `None`, which is indistinguishable from
+    /// "inherit the previous key" and is far worse than a hard error.
+    fn take_attr(attrs: &mut HashMap<String, QuotedOrUnquoted>, name: &str) -> Option<String> {
+        attrs.remove(name).map(|v| match v {
+            QuotedOrUnquoted::Quoted(s) => s,
+            QuotedOrUnquoted::Unquoted(s) => s,
+        })
+    }
+
     pub(crate) fn from_hashmap(
         mut attrs: HashMap<String, QuotedOrUnquoted>,
     ) -> Result<Key, String> {
         let method: KeyMethod = unquoted_string_parse!(attrs, "METHOD")
             .ok_or_else(|| String::from("EXT-X-KEY without mandatory METHOD attribute"))?;
 
-        let uri = quoted_string!(attrs, "URI");
-        let iv = unquoted_string!(attrs, "IV");
-        if method == KeyMethod::None && iv.is_none() {
-            return Err("IV is required unless METHOD is NONE".parse().unwrap());
-        }
-        let keyformat = quoted_string!(attrs, "KEYFORMAT");
-        let keyformatversions = quoted_string!(attrs, "KEYFORMATVERSIONS");
+        // Deliberately no existence or shape validation on URI / IV:
+        //   - IV is never required. RFC 8216 section 5.2: when the IV attribute is
+        //     absent, the Media Sequence Number is used as the IV.
+        //   - Whether URI is present is a consumer-side decision. Returning Err
+        //     from here silently demotes the whole tag to an unknown one instead.
+        //   - A quoted/unquoted mismatch is likewise not a parse failure.
+        let uri = Key::take_attr(&mut attrs, "URI");
+        let iv = Key::take_attr(&mut attrs, "IV");
+        let keyformat = Key::take_attr(&mut attrs, "KEYFORMAT");
+        let keyformatversions = Key::take_attr(&mut attrs, "KEYFORMATVERSIONS");
 
         Ok(Key {
             method,
@@ -1239,5 +1240,54 @@ mod test {
             std::str::from_utf8(output.as_slice()).unwrap(),
             "#EXT-X-CUE-IN"
         )
+    }
+
+    #[test]
+    fn key_none_method_is_parsed() {
+        // Regression test: `#EXT-X-KEY:METHOD=NONE` used to fail parsing because of
+        // an inverted IV guard, which silently demoted the tag to an unknown one.
+        let text =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:10,\nsegment.ts\n";
+        let (_, playlist) = crate::parse_playlist(text.as_bytes()).expect("playlist should parse");
+        let media = match playlist {
+            Playlist::MediaPlaylist(p) => p,
+            _ => panic!("expected a media playlist"),
+        };
+        let segment = &media.segments[0];
+        let key = segment.key.as_ref().expect("METHOD=NONE must yield a Key");
+        assert_eq!(key.method, KeyMethod::None);
+        assert!(key.uri.is_none());
+        assert!(
+            segment.unknown_tags.is_empty(),
+            "the tag must not be demoted to an unknown tag"
+        );
+    }
+
+    #[test]
+    fn key_aes128_without_iv_is_parsed() {
+        // RFC 8216 section 5.2: an absent IV means the Media Sequence Number is used,
+        // so an AES-128 key without an IV attribute is perfectly valid.
+        let text = "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:10,\nsegment.ts\n";
+        let (_, playlist) = crate::parse_playlist(text.as_bytes()).expect("playlist should parse");
+        let media = match playlist {
+            Playlist::MediaPlaylist(p) => p,
+            _ => panic!("expected a media playlist"),
+        };
+        let key = media.segments[0]
+            .key
+            .as_ref()
+            .expect("AES-128 must yield a Key");
+        assert_eq!(key.method, KeyMethod::AES128);
+        assert_eq!(key.uri.as_deref(), Some("key.bin"));
+        assert!(key.iv.is_none());
+    }
+
+    #[test]
+    fn key_method_round_trip() {
+        // The writer can emit METHOD=NONE, so the parser must be able to read it
+        // back. That asymmetry is exactly what the inverted guard had broken.
+        for method in [KeyMethod::None, KeyMethod::AES128, KeyMethod::SampleAES] {
+            assert_eq!(method.to_string().parse::<KeyMethod>().unwrap(), method);
+        }
     }
 }
